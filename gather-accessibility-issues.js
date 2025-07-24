@@ -7,7 +7,7 @@ const minimist = require('minimist');
 
 // --- Configuration ---
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN; // Get token from environment variable
-const ACCESSIBILITY_LABEL = 'accessibility';
+const DEFAULT_PRIMARY_LABEL = 'accessibility'; // New default label
 const WCAG_PATTERNS = [
     /WCAG\s*([0-9\.]+)\s*(A{1,3})/gi, // e.g., WCAG 2.1 AA, WCAG 2.0 A
     /SC\s*([0-9\.]+)/gi,             // e.g., SC 1.3.1
@@ -47,8 +47,9 @@ function findWcagScInText(text) {
 
     WCAG_PATTERNS.forEach(pattern => {
         let match;
+        // Reset lastIndex for global regexes before each new test
+        pattern.lastIndex = 0;
         while ((match = pattern.exec(text)) !== null) {
-            // Adjust based on specific pattern groups if needed
             if (match[0]) {
                 foundSc.add(match[0].toUpperCase().replace(/\s+/g, ' ').trim());
             }
@@ -71,15 +72,28 @@ async function fetchAllPages(apiCall, params) {
     while (hasMore) {
         try {
             const response = await apiCall({ ...params, page, per_page: 100 });
-            if (response.data.length > 0) {
+            if (response.data && response.data.length > 0) {
                 allItems = allItems.concat(response.data);
-                page++;
+                // GitHub API uses 'link' header for pagination. Octokit handles it,
+                // but checking response.data.length is a simple way to know when no more data.
+                // A more robust check might involve checking response.headers.link for 'next'
+                if (response.data.length < 100) { // If less than per_page, assume last page
+                    hasMore = false;
+                }
             } else {
                 hasMore = false;
             }
         } catch (error) {
-            console.error(`Error fetching page ${page}:`, error.message);
-            // Implement more robust error handling / retry logic if needed
+            if (error.status === 404) {
+                 console.warn(`Warning: Repository not found or no access for ${params.owner}/${params.repo}. Skipping.`);
+                 hasMore = false;
+            } else if (error.status === 403 && error.response && error.response.headers && error.response.headers['x-ratelimit-remaining'] === '0') {
+                const resetTime = new Date(parseInt(error.response.headers['x-ratelimit-reset']) * 1000);
+                console.error(`Rate limit exceeded! Please wait until ${resetTime.toLocaleTimeString()} before trying again.`);
+                process.exit(1); // Exit on rate limit
+            } else {
+                console.error(`Error fetching page ${page}:`, error.message);
+            }
             hasMore = false; // Stop on error
         }
     }
@@ -88,10 +102,15 @@ async function fetchAllPages(apiCall, params) {
 
 // --- Main Script Logic ---
 
-async function gatherAccessibilityIssues(orgName) {
+async function gatherAccessibilityIssues(orgName, primaryLabel, additionalLabels) {
     console.log(`Scanning GitHub organization: ${orgName}`);
+    console.log(`Looking for issues with primary label: "${primaryLabel}"`);
+    if (additionalLabels.length > 0) {
+        console.log(`Also including issues with additional labels: "${additionalLabels.join('", "')}"`);
+    }
+
     const issuesData = [];
-    const processedIssueIds = new Set(); // To prevent duplicate issues from different search methods
+    const processedIssueIds = new Set();
 
     // CSV Headers
     const csvHeaders = [
@@ -103,17 +122,20 @@ async function gatherAccessibilityIssues(orgName) {
     // 1. Get all repositories for the organization
     console.log('Fetching repositories...');
     const repositories = await fetchAllPages(octokit.repos.listForOrg, { org: orgName, type: 'public' });
+    if (repositories.length === 0) {
+        console.log(`No public repositories found for ${orgName} or access denied. Exiting.`);
+        return;
+    }
     console.log(`Found ${repositories.length} repositories.`);
 
     for (const repo of repositories) {
-        console.log(`Processing repository: ${repo.full_name}`);
-
-        // Get issues for this repository
+        process.stdout.write(`Processing repository: ${repo.full_name}... `); // Use process.stdout.write for in-line progress
         const repoIssues = await fetchAllPages(octokit.issues.listForRepo, {
             owner: repo.owner.login,
             repo: repo.name,
             state: 'all' // Get both open and closed issues
         });
+        console.log(`Found ${repoIssues.length} issues.`);
 
         for (const issue of repoIssues) {
             // Skip pull requests (issues API returns PRs too)
@@ -126,10 +148,17 @@ async function gatherAccessibilityIssues(orgName) {
             }
             processedIssueIds.add(issue.id);
 
-            const isLabelledAccessibility = issue.labels.some(label => label.name.toLowerCase() === ACCESSIBILITY_LABEL);
-            const isKeywordFound = issue.title.toLowerCase().includes('accessibility') || (issue.body && issue.body.toLowerCase().includes('accessibility'));
+            // Check if issue has any of the specified labels
+            const issueLabels = issue.labels.map(label => label.name.toLowerCase());
+            const hasRelevantLabel = issueLabels.includes(primaryLabel.toLowerCase()) ||
+                                     additionalLabels.some(label => issueLabels.includes(label.toLowerCase()));
 
-            if (!isLabelledAccessibility && !isKeywordFound) {
+            // Check if keyword "accessibility" is in title or body
+            const isKeywordFoundInText = issue.title.toLowerCase().includes('accessibility') ||
+                                         (issue.body && issue.body.toLowerCase().includes('accessibility'));
+
+            // Include issue if it has a relevant label OR contains the keyword "accessibility"
+            if (!hasRelevantLabel && !isKeywordFoundInText) {
                 continue;
             }
 
@@ -145,7 +174,7 @@ async function gatherAccessibilityIssues(orgName) {
                         issue_number: issue.number
                     });
                     if (comments.length > 0) {
-                        lastCommenter = comments[comments.length - 1].user.login;
+                        lastCommenter = comments[comments.length - 1].user ? comments[comments.length - 1].user.login : 'N/A';
                         comments.forEach(comment => {
                             wcagScFound = wcagScFound.concat(findWcagScInText(comment.body));
                         });
@@ -155,13 +184,13 @@ async function gatherAccessibilityIssues(orgName) {
                 }
             }
 
-            // Also check issue body for WCAG SC
+            // Also check issue body and title for WCAG SC
             wcagScFound = wcagScFound.concat(findWcagScInText(issue.body));
+            wcagScFound = wcagScFound.concat(findWcagScInText(issue.title));
             wcagScFound = [...new Set(wcagScFound)]; // Deduplicate WCAG SC found
 
             issuesData.push({
-                "WCAG SC": wcagScFound.join('; '),
-                // MODIFICATION HERE: Combine repo.name and issue.number for unique ID
+                "WCAG SC": wcagScFound.length > 0 ? wcagScFound.join('; ') : null, // Use null if no SC found
                 "Issue ID": `${repo.name}-${issue.number}`,
                 "Issue Title": issue.title,
                 "Issue URL": issue.html_url,
@@ -181,7 +210,7 @@ async function gatherAccessibilityIssues(orgName) {
         }
     }
 
-    console.log(`Found ${issuesData.length} accessibility-related issues.`);
+    console.log(`\nFound ${issuesData.length} accessibility-related issues across ${repositories.length} repositories.`);
 
     // 2. Write to CSV
     const filename = `${orgName}-accessibility-issues-${new Date().toISOString().slice(0, 10)}.csv`;
@@ -200,14 +229,43 @@ async function gatherAccessibilityIssues(orgName) {
     });
 }
 
-// --- Command Line Argument Parsing ---
+// --- Command Line Argument Parsing and Help ---
+
+const showHelp = () => {
+    console.log(`
+Usage: node gather-accessibility-issues.js -r <github_organization_name> [options]
+
+Options:
+  -r, --repo <organization_name>   Required. The GitHub organization to scan (e.g., localgovdrupal).
+  -l, --label <label_name>         Optional. The primary label to scan for (default: "${DEFAULT_PRIMARY_LABEL}").
+  -a, --additional-labels <label1,label2,...>
+                                   Optional. Comma-separated list of additional labels to include.
+  -h, --help                       Show this help message and exit.
+
+Examples:
+  node gather-accessibility-issues.js -r localgovdrupal
+  node gather-accessibility-issues.js --repo your-org --label bug --additional-labels "critical,p1"
+  node gather-accessibility-issues.js -r another-org -l atag
+  node gather-accessibility-issues.js -h
+`);
+};
+
 const argv = minimist(process.argv.slice(2));
 
-if (!argv.r && !argv.repo) {
-    console.log('Usage: node gather-accessibility-issues.js -r <github_organization_name>');
-    console.log('Or: node gather-accessibility-issues.js --repo <github_organization_name>');
+if (argv.h || argv.help) {
+    showHelp();
     process.exit(0);
 }
 
 const organization = argv.r || argv.repo;
-gatherAccessibilityIssues(organization).catch(console.error);
+const primaryLabel = argv.l || argv.label || DEFAULT_PRIMARY_LABEL;
+const additionalLabelsString = argv.a || argv['additional-labels'];
+const additionalLabels = additionalLabelsString ? additionalLabelsString.split(',').map(s => s.trim()) : [];
+
+if (!organization) {
+    console.error('Error: GitHub organization name is required.');
+    showHelp();
+    process.exit(1);
+}
+
+gatherAccessibilityIssues(organization, primaryLabel, additionalLabels).catch(console.error);
